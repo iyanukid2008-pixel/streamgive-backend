@@ -4,16 +4,20 @@ import rateLimit from '@fastify/rate-limit';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import Fastify from 'fastify';
+import type { FastifyError } from 'fastify';
 
 import { prisma } from './db.js';
+import { recordHttpRequest, renderMetrics } from './metrics.js';
+import { getCheckpoint } from './indexer/checkpoint.js';
 import { donorRoutes } from './routes/donors.js';
 import { impactRoutes } from './routes/impact.js';
 import { indexerStatusRoutes } from './routes/indexerStatus.js';
 import { getLatestLedgerSequence } from './stellar/rpc.js';
-import { getCheckpoint } from './indexer/checkpoint.js';
 import { ngoApplicationRoutes } from './routes/ngoApplications.js';
 import { ngoRoutes } from './routes/ngos.js';
 import { streamRoutes } from './routes/streams.js';
+import { registerRequestIdHeader, requestIdOptions } from './requestId.js';
+import { registerCompression } from './plugins/compression.js';
 
 // pino-pretty runs its formatting on a separate worker thread; spawning
 // one per Fastify instance is fine for a single long-running process, but
@@ -22,10 +26,7 @@ import { streamRoutes } from './routes/streams.js';
 const USE_PRETTY_LOGS = !['production', 'test'].includes(process.env.NODE_ENV ?? '');
 
 export type TrustProxySetting =
-  | boolean
-  | string
-  | string[]
-  | ((address: string, hop: number) => boolean);
+  boolean | string | string[] | ((address: string, hop: number) => boolean);
 
 /**
  * Parses the TRUST_PROXY environment variable into a valid Fastify trustProxy configuration.
@@ -74,12 +75,14 @@ export interface BuildServerOptions {
 }
 
 export function buildServer(options?: BuildServerOptions) {
+  const requestStartedAt = new WeakMap<object, bigint>();
   const trustProxySetting =
     options?.trustProxy !== undefined
       ? options.trustProxy
       : parseTrustProxy(process.env.TRUST_PROXY);
 
   const app = Fastify({
+    ...requestIdOptions,
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
       // Structured JSON otherwise (production: for log aggregation; test:
@@ -96,7 +99,10 @@ export function buildServer(options?: BuildServerOptions) {
     trustProxy: trustProxySetting,
   });
 
-  app.setErrorHandler<Error & { statusCode?: number }>((error, request, reply) => {
+  registerRequestIdHeader(app);
+  app.register(registerCompression);
+
+  app.setErrorHandler((error: FastifyError, request, reply) => {
     request.log.error(error);
     const candidateStatusCode =
       typeof error === 'object' && error !== null && 'statusCode' in error
@@ -113,7 +119,13 @@ export function buildServer(options?: BuildServerOptions) {
         ? 'not_found'
         : statusCode === 400
           ? 'invalid_request'
-          : 'internal_server_error';
+          : statusCode === 413
+            ? 'payload_too_large'
+            : statusCode === 415
+              ? 'unsupported_media_type'
+              : statusCode === 429
+                ? 'rate_limited'
+                : 'internal_server_error';
     reply.code(statusCode).send({ error: errorString });
   });
 
@@ -139,17 +151,64 @@ export function buildServer(options?: BuildServerOptions) {
   app.register(cors, {
     origin: allowedOrigins,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['content-type', 'x-admin-address', 'x-admin-signature', 'x-admin-timestamp'],
+    allowedHeaders: [
+      'content-type',
+      'x-admin-address',
+      'x-admin-signature',
+      'x-admin-timestamp',
+      'x-request-id',
+    ],
+    exposedHeaders: ['x-request-id'],
   });
 
   app.register(rateLimit, {
     max: Number(process.env.RATE_LIMIT_MAX ?? 100),
     timeWindow: process.env.RATE_LIMIT_WINDOW ?? '1 minute',
+    // Spell the headers out instead of leaning on the plugin's defaults:
+    // `Retry-After` is the machine-readable contract clients back off on
+    // (RFC 9110 §10.2.3), and the `x-ratelimit-*` headers let a client see
+    // its remaining budget before it is throttled.
+    addHeaders: {
+      'x-ratelimit-limit': true,
+      'x-ratelimit-remaining': true,
+      'x-ratelimit-reset': true,
+      'retry-after': true,
+    },
+  });
+
+  app.addHook('onRequest', async (request) => {
+    requestStartedAt.set(request, process.hrtime.bigint());
+  });
+
+  app.addHook('onResponse', async (request, reply) => {
+    const startedAt = requestStartedAt.get(request);
+    if (startedAt === undefined) return;
+    const durationSeconds = Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
+    recordHttpRequest(
+      request.method,
+      request.routeOptions.url ?? 'unmatched',
+      reply.statusCode,
+      durationSeconds,
+    );
+  });
+
+  /**
+   * Exposes process-local Prometheus metrics.
+   * @route GET /metrics
+   * @auth Public
+   * @returns 200 Prometheus text format (`text/plain; version=0.0.4`).
+   */
+  app.get('/metrics', async (_request, reply) => {
+    return reply.type('text/plain; version=0.0.4; charset=utf-8').send(renderMetrics());
   });
 
   app.register(swagger, {
     openapi: {
-      info: { title: 'StreamGive API', description: 'API for the StreamGive platform', version: '1.0.0' },
+      info: {
+        title: 'StreamGive API',
+        description: 'API for the StreamGive platform',
+        version: '1.0.0',
+      },
       tags: [
         { name: 'Health', description: 'Service health checks' },
         { name: 'NGOs', description: 'NGO directory and profiles' },
@@ -164,6 +223,12 @@ export function buildServer(options?: BuildServerOptions) {
     });
   }
 
+  /**
+   * Checks database and Stellar RPC availability.
+   * @route GET /health
+   * @auth Public
+   * @returns 200 or 503 `{ status: "ok" | "error", db: "ok" | "error", rpc: "ok" | "error" }`.
+   */
   app.get('/health', async (_req, reply) => {
     const [dbResult, rpcResult] = await Promise.allSettled([
       prisma.$queryRaw`SELECT 1`,
@@ -173,10 +238,16 @@ export function buildServer(options?: BuildServerOptions) {
     const db = dbResult.status === 'fulfilled' ? 'ok' : 'error';
     const rpc = rpcResult.status === 'fulfilled' ? 'ok' : 'error';
 
-    const status = db === 'ok' && rpc === 'ok' ? 'ok' : 'error';
-    return reply.code(status === 'ok' ? 200 : 503).send({ status, db, rpc });
+      const status = db === 'ok' && rpc === 'ok' ? 'ok' : 'error';
+      return reply.code(status === 'ok' ? 200 : 503).send({ status, db, rpc });
   });
 
+  /**
+   * Checks readiness, including database availability and indexer lag.
+   * @route GET /health/ready
+   * @auth Public
+   * @returns 200 `{ status: "ok", lag, latestLedger, checkpointLedger }`; 503 `{ status: "error", reason, ... }` when unavailable or not caught up.
+   */
   app.get('/health/ready', async (request, reply) => {
     try {
       // 1. Check DB
@@ -208,27 +279,52 @@ export function buildServer(options?: BuildServerOptions) {
 
   app.addHook('onRoute', (route) => {
     const schemas: Record<string, object> = {
-      '/ngos': {
-        tags: ['NGOs'], summary: 'List verified NGOs',
-        querystring: { type: 'object', properties: {
-          limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 },
-          cursor: { type: 'string', format: 'uuid' },
-          sort: { type: 'string', enum: ['newest', 'oldest', 'name'], default: 'newest' },
-          q: { type: 'string', maxLength: 100 },
-        } },
+      '/v1/ngos': {
+        tags: ['NGOs'],
+        summary: 'List verified NGOs',
+        querystring: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 },
+            cursor: { type: 'string', format: 'uuid' },
+            sort: { type: 'string', enum: ['newest', 'oldest', 'name'], default: 'newest' },
+            q: { type: 'string', maxLength: 100 },
+          },
+        },
       },
-      '/ngos/lookup': {
-        tags: ['NGOs'], summary: 'Find an NGO by Stellar address',
-        querystring: { type: 'object', properties: { address: { type: 'string', pattern: '^G[A-Z2-7]{55}$' } }, required: ['address'] },
+      '/v1/ngos/lookup': {
+        tags: ['NGOs'],
+        summary: 'Find an NGO by Stellar address',
+        querystring: {
+          type: 'object',
+          properties: { address: { type: 'string', pattern: '^G[A-Z2-7]{55}$' } },
+          required: ['address'],
+        },
       },
-      '/ngos/:id/donors': {
-        tags: ['NGOs'], summary: 'List donors for an NGO',
-        params: { type: 'object', properties: { id: { type: 'string', format: 'uuid' } }, required: ['id'] },
-        querystring: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: { type: 'string', format: 'uuid' } } },
+      '/v1/ngos/:id/donors': {
+        tags: ['NGOs'],
+        summary: 'List donors for an NGO',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string', format: 'uuid' } },
+          required: ['id'],
+        },
+        querystring: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', minimum: 1, maximum: 100 },
+            cursor: { type: 'string', format: 'uuid' },
+          },
+        },
       },
-      '/ngos/:id': {
-        tags: ['NGOs'], summary: 'Get an NGO profile and impact totals',
-        params: { type: 'object', properties: { id: { type: 'string', format: 'uuid' } }, required: ['id'] },
+      '/v1/ngos/:id': {
+        tags: ['NGOs'],
+        summary: 'Get an NGO profile and impact totals',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string', format: 'uuid' } },
+          required: ['id'],
+        },
       },
     };
     const schema = schemas[route.url];

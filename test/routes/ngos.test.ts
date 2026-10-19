@@ -3,8 +3,8 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { prisma } from '../../src/db.js';
 import { buildServer } from '../../src/server.js';
-import { fakeAddress, resetDb } from '../helpers/db.js';
 import { signAdminRequest } from '../helpers/adminAuth.js';
+import { fakeAddress, resetDb } from '../helpers/db.js';
 
 const adminKeypair = Keypair.random();
 
@@ -30,6 +30,25 @@ describe('GET /v1/ngos', () => {
     expect(body.ngos).toHaveLength(1);
     expect(body.ngos[0].name).toBe('Verified NGO');
     expect(body.nextCursor).toBeNull();
+
+    await app.close();
+  });
+
+  it("returns an NGO's displayName as its public name", async () => {
+    const app = buildServer();
+
+    await prisma.ngo.create({
+      data: {
+        ownerAddress: fakeAddress('C'),
+        name: 'On-chain name',
+        displayName: 'Curated name',
+        verified: true,
+      },
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/v1/ngos' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().ngos[0].name).toBe('Curated name');
 
     await app.close();
   });
@@ -110,10 +129,20 @@ describe('GET /v1/ngos', () => {
     const app = buildServer();
 
     await prisma.ngo.create({
-      data: { ownerAddress: fakeAddress('C'), name: 'Zeta NGO', verified: true },
+      data: {
+        ownerAddress: fakeAddress('C'),
+        name: 'Zeta NGO',
+        displayName: 'Alpha NGO',
+        verified: true,
+      },
     });
     await prisma.ngo.create({
-      data: { ownerAddress: fakeAddress('A'), name: 'Alpha NGO', verified: true },
+      data: {
+        ownerAddress: fakeAddress('A'),
+        name: 'Alpha NGO',
+        displayName: 'Zulu NGO',
+        verified: true,
+      },
     });
     await prisma.ngo.create({
       data: { ownerAddress: fakeAddress('B'), name: 'Midway NGO', verified: true },
@@ -124,7 +153,7 @@ describe('GET /v1/ngos', () => {
 
     const body = response.json();
     const names = body.ngos.map((n: { name: string }) => n.name);
-    expect(names).toEqual(['Alpha NGO', 'Midway NGO', 'Zeta NGO']);
+    expect(names).toEqual(['Alpha NGO', 'Midway NGO', 'Zulu NGO']);
 
     await app.close();
   });
@@ -163,6 +192,29 @@ describe('GET /v1/ngos', () => {
     await app.close();
   });
 
+  it('searches the public displayName instead of a replaced on-chain name', async () => {
+    const app = buildServer();
+
+    await prisma.ngo.create({
+      data: {
+        ownerAddress: fakeAddress('D'),
+        name: 'Hidden On-chain Name',
+        displayName: 'Visible Public Name',
+        verified: true,
+      },
+    });
+
+    const visible = await app.inject({ method: 'GET', url: '/v1/ngos?q=public' });
+    expect(visible.json().ngos.map((ngo: { name: string }) => ngo.name)).toEqual([
+      'Visible Public Name',
+    ]);
+
+    const hidden = await app.inject({ method: 'GET', url: '/v1/ngos?q=hidden' });
+    expect(hidden.json().ngos).toHaveLength(0);
+
+    await app.close();
+  });
+
   it('returns empty list when q matches nothing', async () => {
     const app = buildServer();
 
@@ -190,7 +242,6 @@ describe('GET /v1/ngos', () => {
   });
 });
 
-describe('GET /v1/ngos/lookup', () => {
 describe('GET /ngos/all (admin)', () => {
   beforeAll(() => {
     process.env.ADMIN_ADDRESS = adminKeypair.publicKey();
@@ -341,7 +392,12 @@ describe('GET /ngos/lookup', () => {
     const app = buildServer();
 
     const ngo = await prisma.ngo.create({
-      data: { ownerAddress: fakeAddress('A'), name: 'Impact NGO', verified: true },
+      data: {
+        ownerAddress: fakeAddress('A'),
+        name: 'Impact NGO',
+        displayName: 'Community Impact',
+        verified: true,
+      },
     });
 
     const response = await app.inject({
@@ -352,7 +408,7 @@ describe('GET /ngos/lookup', () => {
 
     const body = response.json();
     expect(body.id).toBe(ngo.id);
-    expect(body.name).toBe('Impact NGO');
+    expect(body.name).toBe('Community Impact');
 
     await app.close();
   });
@@ -409,7 +465,12 @@ describe('GET /v1/ngos/:id', () => {
     const app = buildServer();
 
     const ngo = await prisma.ngo.create({
-      data: { ownerAddress: fakeAddress('C'), name: 'Impact NGO', verified: true },
+      data: {
+        ownerAddress: fakeAddress('C'),
+        name: 'Impact NGO',
+        displayName: 'Community Impact',
+        verified: true,
+      },
     });
     const donor = await prisma.donor.create({ data: { address: fakeAddress('D') } });
 
@@ -430,6 +491,7 @@ describe('GET /v1/ngos/:id', () => {
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
+    expect(body.name).toBe('Community Impact');
     expect(body.stats.totalCommitted).toBe('1000');
     expect(body.stats.totalWithdrawn).toBe('600');
     expect(body.stats.activeStreamCount).toBe(1);

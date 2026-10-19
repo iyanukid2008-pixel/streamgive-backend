@@ -9,12 +9,38 @@ serves the data that powers the frontend.
 - TypeScript, Node.js
 - Fastify (API server)
 - PostgreSQL
+- [Architecture overview](ARCHITECTURE.md): how the API, indexer, and
+  notification dispatcher run together and shut down.
 
 ## API
 
-Every HTTP API route is mounted under `/v1`, including health and admin routes.
-For example: `GET /v1/health`, `GET /v1/ngos`, `GET /v1/streams`, and
-`GET /v1/indexer/status`.
+Most API routes, including admin routes, are mounted under `/v1`. Health checks
+are available at `/health` and `/health/ready`; Prometheus metrics are at
+`/metrics`. See the [API reference](docs/API.md) for every endpoint, its
+parameters, authentication requirements, and response examples.
+
+## Rate limits
+
+The API allows up to **100 requests per minute per client IP** by default.
+`POST /v1/ngo-applications` has a tighter limit of **5 requests per minute
+per client IP**. Exceeding a limit returns `429 Too Many Requests` with
+`{"error":"rate_limited"}`. Responses include `Retry-After` and
+`X-RateLimit-*` headers to help clients know when to retry.
+
+The global limit can be adjusted with `RATE_LIMIT_MAX` and
+`RATE_LIMIT_WINDOW`; the application submission limit can be adjusted with
+`RATE_LIMIT_APPLICATION_MAX` and `RATE_LIMIT_APPLICATION_WINDOW`.
+
+Rate-limit state is kept in memory by each server process, not shared between
+instances or persisted. With multiple instances, each instance tracks its own
+limits, so a client's effective allowance can be higher than the configured
+per-instance limit. Restarting an instance also clears its rate-limit state.
+
+## Prometheus metrics
+
+`GET /metrics` returns Prometheus text format (`text/plain; version=0.0.4`).
+It exposes HTTP request totals and duration, indexer checkpoint and lag, and webhook
+delivery totals. Configure Prometheus to scrape it on the API host and port.
 
 ## NGO Verification Model
 
@@ -46,7 +72,7 @@ generic stale-signature failure.
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 
@@ -68,7 +94,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -77,7 +103,23 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
+npm run db:seed                 # optional: load sample NGOs, donors and streams
+npm run dev
+```
+
+The test database is created by the `postgres` service in `docker-compose.yml`
+as `streamgive_test`. Start it with `docker compose up -d postgres`, copy
+`.env.test.example` to `.env.test`, run `npm run db:push:test` to sync the
+Prisma schema to that database, and only then run `npm test`.
+
+## Troubleshooting
+
+```
+cp .env.example .env
+docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
+npm install
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -86,7 +128,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -95,34 +137,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
-npm run db:seed                 # optional: load sample NGOs, donors and streams
-npm run dev
-```
-
-```
-cp .env.example .env
-docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
-npm install
-npm run db:push                 # sync the schema onto streamgive
-npm run db:seed                 # optional: load sample NGOs, donors and streams
-npm run dev
-```
-
-```
-cp .env.example .env
-docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
-npm install
-npm run db:push                 # sync the schema onto streamgive
-npm run db:seed                 # optional: load sample NGOs, donors and streams
-npm run dev
-```
-
-```
-cp .env.example .env
-docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
-npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -141,10 +156,12 @@ where `<hex>` is the lower-case hex HMAC-SHA256 of the **raw request body**,
 keyed with `NOTIFY_WEBHOOK_SECRET`. There is no prefix, timestamp or version
 tag in the value — it is the bare digest.
 
-Verify it against the bytes you read off the wire, before parsing them as
-JSON: re-serialising the parsed object can reorder keys or change whitespace,
-and the digest would no longer match. Compare in constant time so the
-comparison itself does not leak the expected digest a byte at a time.
+## Data model and API statistics
+
+See [docs/DATA-MODEL.md](./docs/DATA-MODEL.md) for the entity relationship
+diagram and the exact calculations used by `/ngos/:id` and `/impact/:ngoId`.
+
+## Notification events
 
 ```js
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -171,7 +188,7 @@ than a resting state.
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 
@@ -179,16 +196,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
-npm run db:seed                 # optional: load sample NGOs, donors and streams
-npm run dev
-```
-
-```
-cp .env.example .env
-docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
-npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -197,7 +205,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -206,7 +214,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -215,7 +223,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -224,7 +232,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -233,7 +241,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -242,7 +250,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -251,7 +259,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -260,7 +268,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -269,7 +277,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -278,7 +286,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -287,7 +295,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -296,7 +304,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -305,7 +313,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -314,7 +322,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -323,7 +331,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -332,7 +340,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -341,7 +349,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -350,7 +358,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -359,7 +367,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -368,7 +376,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -377,7 +385,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -386,7 +394,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -395,7 +403,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -404,7 +412,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -413,7 +421,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -422,7 +430,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -431,7 +439,7 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
@@ -440,7 +448,15 @@ npm run dev
 cp .env.example .env
 docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
 npm install
-npm run db:push                 # sync the schema onto streamgive
+npm run db:deploy               # apply Prisma migrations to streamgive
 npm run db:seed                 # optional: load sample NGOs, donors and streams
 npm run dev
 ```
+
+```
+cp .env.example .env
+docker compose up -d postgres   # starts Postgres (+ a streamgive_test DB)
+npm install
+npm run db:deploy               # apply Prisma migrations to streamgive
+npm run db:seed                 # optional: load sample NGOs, donors and streams
+npm run dev

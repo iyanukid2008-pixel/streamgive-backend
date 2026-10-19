@@ -3,7 +3,9 @@ import { z } from 'zod';
 
 import { prisma } from '../db.js';
 import { sendPublicCacheable } from './cacheable.js';
+import { getPublicNgoName } from './ngoName.js';
 
+/** Params for GET /v1/impact/:ngoId; `ngoId` must be an NGO UUID. */
 const paramsSchema = z.object({ ngoId: z.string().uuid() });
 
 /**
@@ -15,6 +17,12 @@ const paramsSchema = z.object({ ngoId: z.string().uuid() });
  * need to scan every stream on the platform to render.
  */
 export async function impactRoutes(app: FastifyInstance): Promise<void> {
+  /**
+   * Returns platform-wide committed/withdrawn totals and activity counts.
+   * @route GET /v1/impact
+   * @auth Public
+   * @returns 200 `{ totalCommitted: string, totalWithdrawn: string, activeStreams: number, verifiedNgoCount: number }`.
+   */
   app.get('/impact', async (request, reply) => {
     const [streams, verifiedNgoCount] = await Promise.all([
       prisma.stream.findMany({ select: { balance: true, withdrawn: true, status: true } }),
@@ -42,15 +50,13 @@ export async function impactRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-      return {
-        totalCommitted: totalCommitted.toString(),
-        totalWithdrawn: totalWithdrawn.toString(),
-        activeStreams,
-        verifiedNgoCount,
-      };
-    },
-  );
-
+  /**
+   * Returns one NGO's contribution and share of platform-wide impact.
+   * @route GET /v1/impact/:ngoId
+   * @param ngoId NGO UUID
+   * @auth Public
+   * @returns 200 NGO impact totals, stream counts, unique donor count, and `platformSharePercent`; 400 invalid UUID; 404 `{ error: "not_found" }`.
+   */
   app.get(
     '/impact/:ngoId',
     {
@@ -115,15 +121,16 @@ export async function impactRoutes(app: FastifyInstance): Promise<void> {
       const platformSharePercent =
         platformCommitted > 0n ? Number((ngoCommitted * 10000n) / platformCommitted) / 100 : 0;
 
-    return sendPublicCacheable(request, reply, {
-      ngoId: ngo.id,
-      name: ngo.name,
-      totalCommitted: ngoCommitted.toString(),
-      totalWithdrawn: ngoWithdrawn.toString(),
-      activeStreams: ngo.streams.filter((s) => s.status === 'ACTIVE').length,
-      cancelledStreams: ngo.streams.filter((s) => s.status === 'CANCELLED').length,
-      uniqueDonors: new Set(ngo.streams.map((s) => s.donorId)).size,
-      platformSharePercent,
-    });
-  });
+      return sendPublicCacheable(request, reply, {
+        ngoId: ngo.id,
+        name: getPublicNgoName(ngo),
+        totalCommitted: ngoCommitted.toString(),
+        totalWithdrawn: ngoWithdrawn.toString(),
+        activeStreams: ngo.streams.filter((s) => s.status === 'ACTIVE').length,
+        cancelledStreams: ngo.streams.filter((s) => s.status === 'CANCELLED').length,
+        uniqueDonors: new Set(ngo.streams.map((s) => s.donorId)).size,
+        platformSharePercent,
+      });
+    },
+  );
 }
